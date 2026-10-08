@@ -1,127 +1,183 @@
-import requests
-from bs4 import BeautifulSoup
 import streamlit as st
-import google.generativeai as genai
+import pandas as pd
+import numpy as np
+import json
+import os
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, urljoin
-import time
-
-st.set_page_config(page_title="採用FAQボット", page_icon="🤖")
-st.title("採用FAQチャットボット (サイト全体連携版)")
-
-# サイドバーの設定
-st.sidebar.markdown("### ⚙️ 設定")
-api_key = st.sidebar.text_input("Gemini APIキー", type="password")
-target_url = st.sidebar.text_input("読み込ませたい自社のURL", value="https://d4c-creative.com/")
+import google.generativeai as genai
 
 # ==========================================
-# サイト全体を巡回（クロール）してテキストを抽出する関数
+# 0. 初期設定とAPI設定
 # ==========================================
-EXCLUDE_DIRS = ['/wp/', '/test/', '/resalts/']
-MAX_PAGES = 30  # 読み込む最大ページ数（プロトタイプ用）
+st.set_page_config(page_title="競馬AI ROIオプティマイザ", page_icon="🏇", layout="wide")
 
-@st.cache_data(show_spinner=False)
-def get_all_text_from_site(base_url):
-    if not base_url:
-        return ""
-    
-    visited = set()
-    urls_to_visit = [base_url]
-    all_text = ""
-    base_domain = urlparse(base_url).netloc
-
-    with st.spinner("サイト全体を巡回してデータを読み込んでいます...（数分かかる場合があります）"):
-        while urls_to_visit and len(visited) < MAX_PAGES:
-            current_url = urls_to_visit.pop(0)
-
-            # 既に訪問済みならスキップ
-            if current_url in visited:
-                continue
-
-            # 【重要】除外ディレクトリが含まれていたらスキップ
-            path = urlparse(current_url).path
-            if any(exclude in path for exclude in EXCLUDE_DIRS):
-                continue
-
-            visited.add(current_url)
-
-            try:
-                # ページの内容を取得
-                response = requests.get(current_url, timeout=10)
-                if response.status_code != 200:
-                    continue
-
-                soup = BeautifulSoup(response.content, 'html.parser')
-                text = soup.get_text(separator='\n', strip=True)
-                
-                # 抽出したテキストを合体させる（どのページの情報かも記載する）
-                all_text += f"\n\n【ページ: {current_url}】\n{text}"
-
-                # ページ内にあるリンクをすべて探し、次に訪問するリストに追加
-                for link in soup.find_all('a', href=True):
-                    next_url = urljoin(current_url, link['href']).split('#')[0] # #以降（ページ内ジャンプ）は無視
-                    next_domain = urlparse(next_url).netloc
-                    
-                    # 同じドメイン内で、まだ訪問していない新しいURLなら追加
-                    if next_domain == base_domain and next_url not in visited and next_url not in urls_to_visit:
-                        urls_to_visit.append(next_url)
-                
-                # 相手サーバーに負荷をかけないよう、少し待機する（マナー）
-                time.sleep(0.5)
-
-            except Exception as e:
-                print(f"エラー ({current_url}): {e}")
-
-    return all_text
+# Streamlit Secretsまたは環境変数からAPIキーを取得
+GOOGLE_API_KEY = st.secrets.get("GOOGLE_API_KEY", os.environ.get("GOOGLE_API_KEY", ""))
+if GOOGLE_API_KEY:
+    genai.configure(api_key=GOOGLE_API_KEY)
 
 # ==========================================
-# メイン処理
+# 1. AI予測 & 資金管理ロジック
 # ==========================================
-if api_key and target_url:
-    # クローラーを実行してサイト全体のテキストを取得
-    web_text = get_all_text_from_site(target_url)
-    
-    genai.configure(api_key=api_key)
-    
-    # セッションにモデルとチャット履歴がなければ初期化
-    if "chat_session" not in st.session_state:
-        SYSTEM_INSTRUCTION = f"""
-        あなたは優秀な企業の採用アシスタントです。
-        以下の【自社Webサイト全体のデータ】のみを参考にして、求職者からの質問に丁寧な言葉遣いで回答してください。
-        データに書かれていない質問には絶対に推測で答えず、「その質問については、お手数ですが面接時に直接採用担当へお問い合わせください」と回答してください。
-
-        【自社Webサイト全体のデータ】
-        {web_text}
-        """
-
+def get_gemini_prediction(race_data_text):
+    """Geminiを使ってレースデータから実質勝率を予測する"""
+    system_prompt = """
+    あなたは競馬の確率論に精通したプロのデータサイエンティストです。
+    提供されたデータのみから「その馬が1着になる実質勝率」を算出し、以下のJSONフォーマットのみを出力してください。
+    {
+      "horse_number": 1,
+      "predicted_win_rate": 0.15,
+      "confidence_score": 8,
+      "reasoning": "根拠"
+    }
+    """
+    try:
         model = genai.GenerativeModel(
-            model_name="gemini-3.5-flash", # バージョンを修正
-            system_instruction=SYSTEM_INSTRUCTION
+            'gemini-1.5-flash',
+            system_instruction=system_prompt
         )
+        generation_config = genai.GenerationConfig(
+            response_mime_type="application/json",
+            temperature=0.2,
+        )
+        response = model.generate_content(
+            race_data_text,
+            generation_config=generation_config
+        )
+        return json.loads(response.text)
+    except Exception as e:
+        return {"error": str(e)}
+
+def calculate_kelly_bet(predicted_win_rate, odds, bankroll, kelly_fraction=0.25):
+    """ケリー基準を用いて最適なベット額を計算する"""
+    expected_value = predicted_win_rate * odds
+    
+    if expected_value <= 1.0:
+        return {"action": "見送り", "bet_amount": 0, "percentage": 0.0, "ev": round(expected_value, 2)}
         
-        st.session_state.messages = []
-        st.session_state.chat_session = model.start_chat(history=[])
+    b = odds - 1.0
+    p = predicted_win_rate
+    q = 1.0 - p
+    
+    f = (b * p - q) / b
+    adjusted_fraction = f * kelly_fraction
+    bet_amount = int((bankroll * adjusted_fraction) // 100 * 100)
+    
+    return {
+        "action": "買い" if bet_amount > 0 else "見送り",
+        "bet_amount": bet_amount,
+        "percentage": round(adjusted_fraction * 100, 2),
+        "ev": round(expected_value, 2)
+    }
 
-    # 過去のメッセージを画面に描画
-    for message in st.session_state.messages:
-        with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+# ==========================================
+# 2. ダミーデータ生成（バックテスト・予測画面用）
+# ==========================================
+@st.cache_data
+def load_mock_backtest_data(initial_bankroll, kelly_fraction):
+    dates = pd.date_range(start="2025-01-01", periods=100, freq="W-SUN")
+    bankroll = initial_bankroll
+    history = []
+    
+    for d in dates:
+        is_win = np.random.rand() < 0.22 
+        bet_amount = int((bankroll * kelly_fraction * 0.1) // 100 * 100)
+        bankroll -= bet_amount
+        return_amount = int(bet_amount * np.random.uniform(5.0, 12.0)) if is_win else 0
+        bankroll += return_amount
+        history.append({"日付": d, "購入額": bet_amount, "払戻額": return_amount, "資金残高": bankroll})
+        
+    df = pd.DataFrame(history)
+    summary = {
+        "初期資金": initial_bankroll,
+        "最終資金": int(bankroll),
+        "回収率 (ROI)": f"{((df['払戻額'].sum() / df['購入額'].sum()) * 100):.1f}%" if df['購入額'].sum() > 0 else "0%",
+        "最大ドローダウン": "-28.4%",
+    }
+    return summary, df
 
-    # ユーザーからの入力
-    if prompt := st.chat_input("質問を入力してください"):
-        with st.chat_message("user"):
-            st.markdown(prompt)
-        st.session_state.messages.append({"role": "user", "content": prompt})
+def load_weekend_predictions(current_bankroll, kelly_fraction):
+    raw_data = [
+        {"レース": "東京11R", "馬番": 7, "馬名": "ジェミニフラッシュ", "AI勝率": 0.185, "オッズ": 8.5},
+        {"レース": "東京12R", "馬番": 3, "馬名": "データストーム", "AI勝率": 0.100, "オッズ": 5.2},
+        {"レース": "京都11R", "馬番": 12, "馬名": "ケリーインパクト", "AI勝率": 0.080, "オッズ": 15.0},
+    ]
+    results = []
+    for d in raw_data:
+        kelly = calculate_kelly_bet(d["AI勝率"], d["オッズ"], current_bankroll, kelly_fraction)
+        results.append({
+            "レース": d["レース"],
+            "馬番": d["馬番"],
+            "馬名": d["馬名"],
+            "AI予測勝率": f"{d['AI勝率']*100:.1f}%",
+            "オッズ": d["オッズ"],
+            "期待値 (EV)": kelly["ev"],
+            "指示": kelly["action"],
+            "推奨投資割合": f"{kelly['percentage']}%",
+            "推奨購入額": f"¥{kelly['bet_amount']:,}"
+        })
+    return pd.DataFrame(results)
 
-        with st.chat_message("assistant"):
-            with st.spinner("回答を生成中..."):
+# ==========================================
+# 3. UI画面
+# ==========================================
+st.sidebar.title("🏇 AI競馬 ROIシステム")
+page = st.sidebar.radio("メニュー", ["📈 バックテスト分析", "🔮 今週末の予測・投票", "🛠️ 自動スクレイピング＆予測"])
+
+st.sidebar.markdown("---")
+st.sidebar.header("⚙️ 資金管理設定")
+initial_bankroll = st.sidebar.number_input("初期資金 / 現在資金 (円)", min_value=10000, value=100000, step=10000)
+kelly_fraction = st.sidebar.slider("ケリー係数", min_value=0.1, max_value=1.0, value=0.25, step=0.05)
+
+if page == "📈 バックテスト分析":
+    st.title("📈 バックテスト結果")
+    summary, history_df = load_mock_backtest_data(initial_bankroll, kelly_fraction)
+    
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("初期資金", f"¥{summary['初期資金']:,}")
+    col2.metric("最終資金", f"¥{summary['最終資金']:,}", f"{summary['最終資金'] - summary['初期資金']:,} 円")
+    col3.metric("回収率 (ROI)", summary['回収率 (ROI)'])
+    col4.metric("最大ドローダウン", summary['最大ドローダウン'], delta_color="inverse")
+    
+    st.line_chart(history_df.set_index("日付")["資金残高"])
+    st.dataframe(history_df, use_container_width=True)
+
+elif page == "🔮 今週末の予測・投票":
+    st.title("🔮 今週末の最適ベット額")
+    df = load_weekend_predictions(initial_bankroll, kelly_fraction)
+    
+    def highlight_action(row):
+        return ['background-color: #d4edda; color: #155724'] * len(row) if row['指示'] == '買い' else ['background-color: #f8d7da; color: #721c24'] * len(row)
+
+    st.dataframe(df.style.apply(highlight_action, axis=1), use_container_width=True)
+
+elif page == "🛠️ 自動スクレイピング＆予測":
+    st.title("🛠️ 全自動スクレイピング＆予測テスト")
+    st.write("netkeibaなどの出馬表URLを入力すると、自動でデータを取得してAIが予測します。")
+    
+    target_url = st.text_input("出馬表URLを入力", placeholder="例: https://race.netkeiba.com/race/shutuba.html?race_id=...")
+    
+    if st.button("データを取得して予測を実行"):
+        if not target_url:
+            st.warning("URLを入力してください。")
+        elif not GOOGLE_API_KEY:
+            st.error("APIキーが設定されていません。Streamlit CloudのSecretsを設定してください。")
+        else:
+            with st.spinner('ウェブサイトからデータを取得中...'):
                 try:
-                    response = st.session_state.chat_session.send_message(prompt)
-                    st.markdown(response.text)
-                    st.session_state.messages.append({"role": "assistant", "content": response.text})
+                    headers = {'User-Agent': 'Mozilla/5.0'}
+                    response = requests.get(target_url, headers=headers)
+                    response.encoding = 'euc-jp'
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    for script in soup(["script", "style"]):
+                        script.extract()
+                    race_text = soup.get_text(separator=' ', strip=True)
+                    
+                    st.success("データ取得完了！Geminiで分析中...")
+                    result = get_gemini_prediction(race_text)
+                    st.json(result)
+                    
                 except Exception as e:
-                    st.error(f"APIエラーが発生しました: {e}")
-
-elif not api_key:
-    st.info("👈 左側のサイドバーにGemini APIキーを入力してください。")
+                    st.error(f"エラーが発生しました: {e}")
