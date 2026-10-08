@@ -1,3 +1,5 @@
+import requests
+from bs4 import BeautifulSoup
 import streamlit as st
 import google.generativeai as genai
 import requests
@@ -82,28 +84,31 @@ if api_key and target_url:
     
     genai.configure(api_key=api_key)
     
-    SYSTEM_INSTRUCTION = f"""
-    あなたは優秀な企業の採用アシスタントです。
-    以下の【自社Webサイト全体のデータ】のみを参考にして、求職者からの質問に丁寧な言葉遣いで回答してください。
-    データに書かれていない質問には絶対に推測で答えず、「その質問については、お手数ですが面接時に直接採用担当へお問い合わせください」と回答してください。
+    # セッションにモデルとチャット履歴がなければ初期化
+    if "chat_session" not in st.session_state:
+        SYSTEM_INSTRUCTION = f"""
+        あなたは優秀な企業の採用アシスタントです。
+        以下の【自社Webサイト全体のデータ】のみを参考にして、求職者からの質問に丁寧な言葉遣いで回答してください。
+        データに書かれていない質問には絶対に推測で答えず、「その質問については、お手数ですが面接時に直接採用担当へお問い合わせください」と回答してください。
 
-    【自社Webサイト全体のデータ】
-    {web_text}
-    """
+        【自社Webサイト全体のデータ】
+        {web_text}
+        """
 
-    model = genai.GenerativeModel(
-        model_name="gemini-3.6-flash",
-        system_instruction=SYSTEM_INSTRUCTION
-    )
-
-    if "messages" not in st.session_state:
+        model = genai.GenerativeModel(
+            model_name="gemini-3.5-flash", # バージョンを修正
+            system_instruction=SYSTEM_INSTRUCTION
+        )
+        
         st.session_state.messages = []
         st.session_state.chat_session = model.start_chat(history=[])
 
+    # 過去のメッセージを画面に描画
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
             st.markdown(message["content"])
 
+    # ユーザーからの入力
     if prompt := st.chat_input("質問を入力してください"):
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -111,10 +116,12 @@ if api_key and target_url:
 
         with st.chat_message("assistant"):
             with st.spinner("回答を生成中..."):
-                response = st.session_state.chat_session.send_message(prompt)
-                st.markdown(response.text)
-        
-        st.session_state.messages.append({"role": "assistant", "content": response.text})
+                try:
+                    response = st.session_state.chat_session.send_message(prompt)
+                    st.markdown(response.text)
+                    st.session_state.messages.append({"role": "assistant", "content": response.text})
+                except Exception as e:
+                    st.error(f"APIエラーが発生しました: {e}")
 
 elif not api_key:
     st.info("👈 左側のサイドバーにGemini APIキーを入力してください。")
